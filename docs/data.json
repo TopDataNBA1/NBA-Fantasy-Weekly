@@ -1,0 +1,15 @@
+{
+  "meta": {
+    "phase": 18,
+    "week_start": "2026-02-09",
+    "week_end": "2026-02-15",
+    "today": "2026-02-11",
+    "today_index": 2,
+    "day_labels": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+    "total_players": 0,
+    "last_updated": "",
+    "generated_at": "2026-02-11T06:00:00+00:00",
+    "note": "Sample file — real data will appear after the first scraper run."
+  },
+  "rankings": []
+}
