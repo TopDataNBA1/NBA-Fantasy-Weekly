@@ -98,8 +98,13 @@ def fetch_all_standings():
 
 
 def get_today_str():
-    """Get today's date in YYYY-MM-DD (UTC)."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    """
+    Get today's date in YYYY-MM-DD using US Eastern Time.
+    The NBA operates on US time, so when our scraper runs at 8:00 AM CET
+    (2:00-3:00 AM ET), the data corresponds to the current US date.
+    """
+    ET = timezone(timedelta(hours=-5))  # EST (UTC-5)
+    return datetime.now(ET).strftime("%Y-%m-%d")
 
 
 def get_week_bounds(date_str):
