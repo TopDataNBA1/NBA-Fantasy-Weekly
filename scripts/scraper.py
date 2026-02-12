@@ -331,8 +331,16 @@ def build_output(weekly_data, today_str, last_updated):
         day_dt = monday_dt + timedelta(days=i)
         day_labels.append(day_dt.strftime("%a"))
 
+    # Calculate NBA Fantasy week number
+    # Season Week 1 started Monday Oct 20, 2025
+    # Each subsequent Monday = +1 week
+    season_start = datetime(2025, 10, 20)  # Monday of Week 1
+    weeks_diff = (monday_dt - season_start).days // 7
+    nba_week = 1 + weeks_diff
+
     output = {
         "meta": {
+            "week_number": nba_week,
             "week_start": monday_str,
             "week_end": sunday_str,
             "today": today_str,
