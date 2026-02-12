@@ -1,11 +1,18 @@
 """
-NBA Fantasy Salary Cup Edition — Daily Scraper
+NBA Fantasy Salary Cup Edition — Daily Scraper v3
 Fetches all entries from the NBA Fantasy API for league 431 (TOTAL)
 and computes weekly rankings (Mon-Sun).
+
+Key findings about the API:
+  - All point values are multiplied by 10 (divide by 10 for real points)
+  - total: cumulative season points (×10)
+  - event_total: points scored TODAY (×10), not the whole week
+  - phase=1 gives the overall season standings (what we want)
+  - Weekly ranking = sum of daily event_totals across the week
+    OR = (total on latest day) - (total at start of week)
 """
 
 import json
-import os
 import time
 import urllib.request
 import urllib.error
@@ -14,11 +21,13 @@ from pathlib import Path
 
 # --- Configuration ---
 LEAGUE_ID = 431
+PHASE = 1  # phase=1 = overall season standings
 API_BASE = "https://es.nbafantasy.nba.com/api/leagues-classic"
 PER_PAGE = 50
 MAX_RETRIES = 3
-RETRY_DELAY = 5  # seconds
-REQUEST_DELAY = 0.5  # delay between requests to be respectful
+RETRY_DELAY = 5
+REQUEST_DELAY = 0.5
+POINTS_DIVISOR = 10  # API returns values ×10
 
 # Paths
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -27,31 +36,11 @@ DAILY_DIR = DATA_DIR / "daily"
 OUTPUT_FILE = PROJECT_ROOT / "docs" / "data.json"
 
 
-def get_current_phase():
-    """Fetch the current phase/gameweek from a known entry."""
-    url = "https://es.nbafantasy.nba.com/api/entry/8857/phase/1/standings/"
-    try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; NBAFantasyWeekly/1.0)"
-        })
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-            # Find the entry for league 431 and get the latest phase
-            for entry in data:
-                if entry.get("league_id") == LEAGUE_ID:
-                    return entry.get("phase", 1)
-    except Exception as e:
-        print(f"Warning: Could not detect phase automatically: {e}")
-
-    # Fallback: try to detect from standings
-    return None
-
-
-def fetch_standings_page(page, phase):
+def fetch_standings_page(page):
     """Fetch a single page of standings."""
     url = (
         f"{API_BASE}/{LEAGUE_ID}/standings/"
-        f"?page_new_entries=1&page_standings={page}&phase={phase}"
+        f"?page_new_entries=1&page_standings={page}&phase={PHASE}"
     )
 
     for attempt in range(MAX_RETRIES):
@@ -76,18 +65,18 @@ def fetch_standings_page(page, phase):
                 raise
 
 
-def fetch_all_standings(phase):
-    """Fetch all pages of standings for a given phase."""
+def fetch_all_standings():
+    """Fetch all pages of standings."""
     all_entries = []
     page = 1
     total_pages_estimate = "?"
 
-    print(f"Fetching standings for phase {phase}...")
+    print(f"Fetching standings for league {LEAGUE_ID}, phase {PHASE}...")
 
     while True:
         print(f"  Page {page}/{total_pages_estimate}...", end=" ", flush=True)
 
-        data = fetch_standings_page(page, phase)
+        data = fetch_standings_page(page)
         standings = data.get("standings", {})
         results = standings.get("results", [])
         has_next = standings.get("has_next", False)
@@ -99,45 +88,34 @@ def fetch_all_standings(phase):
             break
 
         page += 1
-        # Estimate total pages
-        if page == 2 and len(all_entries) > 0:
-            league_info = data.get("league", {})
+        if page == 2:
             total_pages_estimate = "~1200+"
 
         time.sleep(REQUEST_DELAY)
 
-    return all_entries, data.get("last_updated_data", "")
+    last_updated = data.get("last_updated_data", "")
+    return all_entries, last_updated
 
 
 def get_today_str():
-    """Get today's date string in YYYY-MM-DD format (UTC)."""
+    """Get today's date in YYYY-MM-DD (UTC)."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def get_week_bounds(date_str):
-    """
-    Get Monday and Sunday of the week containing the given date.
-    Returns (monday_str, sunday_str).
-    """
+    """Get Monday and Sunday of the week containing the given date."""
     dt = datetime.strptime(date_str, "%Y-%m-%d")
-    monday = dt - timedelta(days=dt.weekday())  # Monday
-    sunday = monday + timedelta(days=6)  # Sunday
+    monday = dt - timedelta(days=dt.weekday())
+    sunday = monday + timedelta(days=6)
     return monday.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d")
 
 
-def get_week_number(date_str):
-    """Get ISO week number."""
-    dt = datetime.strptime(date_str, "%Y-%m-%d")
-    return dt.isocalendar()[1]
-
-
-def save_daily_snapshot(entries, phase, date_str):
+def save_daily_snapshot(entries, date_str):
     """Save today's raw standings data."""
     DAILY_DIR.mkdir(parents=True, exist_ok=True)
 
     snapshot = {
         "date": date_str,
-        "phase": phase,
         "count": len(entries),
         "entries": [
             {
@@ -170,102 +148,125 @@ def load_daily_snapshot(date_str):
 
 def compute_weekly_ranking(today_str):
     """
-    Compute weekly ranking based on available daily snapshots.
-    Week = Monday to Sunday.
+    Compute weekly ranking based on daily snapshots.
+
+    - event_total = today's points (×10)
+    - Weekly total = sum of event_totals for each day we have data
+      OR for days we missed, use total(day_after) - total(day_before)
+    - Daily points column = event_total / 10 for each day
+    - Movement = rank change vs yesterday
     """
     monday_str, sunday_str = get_week_bounds(today_str)
     today_dt = datetime.strptime(today_str, "%Y-%m-%d")
     monday_dt = datetime.strptime(monday_str, "%Y-%m-%d")
 
-    print(f"Computing weekly ranking for week {monday_str} to {sunday_str}")
+    print(f"Computing weekly ranking for {monday_str} to {sunday_str}")
 
     # Load all available daily snapshots for this week
     daily_snapshots = {}
     for i in range(7):
         day_dt = monday_dt + timedelta(days=i)
         day_str = day_dt.strftime("%Y-%m-%d")
+        if day_dt > today_dt:
+            break
         snapshot = load_daily_snapshot(day_str)
         if snapshot:
             daily_snapshots[day_str] = snapshot
-            print(f"  Loaded snapshot for {day_str} ({snapshot['count']} entries)")
+            print(f"  Loaded {day_str} ({snapshot['count']} entries)")
 
     if not daily_snapshots:
         print("No snapshots available for this week!")
         return None
 
-    # Get the latest snapshot to use as the base player list
-    latest_day = max(daily_snapshots.keys())
-    latest_snapshot = daily_snapshots[latest_day]
+    sorted_days = sorted(daily_snapshots.keys())
+    latest_day = sorted_days[-1]
 
-    # Build a lookup: entry_id -> {day_str: total_points}
-    entry_totals = {}  # entry_id -> {date: total}
-    entry_info = {}  # entry_id -> {player_name, entry_name}
+    # Build lookups
+    # entry_id -> {day_str: {total, event_total}}
+    entry_daily = {}
+    entry_info = {}
 
-    for day_str, snapshot in sorted(daily_snapshots.items()):
+    for day_str, snapshot in daily_snapshots.items():
         for e in snapshot["entries"]:
             eid = e["entry"]
             entry_info[eid] = {
                 "player_name": e["player_name"],
                 "entry_name": e["entry_name"],
             }
-            if eid not in entry_totals:
-                entry_totals[eid] = {}
-            entry_totals[eid][day_str] = e["total"]
+            if eid not in entry_daily:
+                entry_daily[eid] = {}
+            entry_daily[eid][day_str] = {
+                "total": e["total"],
+                "event_total": e["event_total"],
+            }
 
-    # We need a reference point: the total at the END of the day before Monday
-    # (i.e., the Sunday of the previous week). If we don't have that,
-    # we use the earliest available snapshot's total minus that day's event_total.
-    # OR we use the first day of the week as baseline.
+    # Also try to load last Sunday (day before this week) for gap filling
+    prev_sunday_str = (monday_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    prev_sunday_snapshot = load_daily_snapshot(prev_sunday_str)
+    prev_sunday_totals = {}
+    if prev_sunday_snapshot:
+        print(f"  Loaded previous week end: {prev_sunday_str}")
+        for e in prev_sunday_snapshot["entries"]:
+            prev_sunday_totals[e["entry"]] = e["total"]
 
-    # Strategy: Find the earliest day's data and compute daily deltas
-    sorted_days = sorted(daily_snapshots.keys())
-
-    # For the "previous day" reference (for movement calculation),
-    # we need yesterday's ranking
+    # Compute weekly data for each entry
     yesterday_str = (today_dt - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # Compute weekly points for each entry
     weekly_data = []
 
     for eid, info in entry_info.items():
-        totals = entry_totals.get(eid, {})
+        daily = entry_daily.get(eid, {})
 
-        # Calculate daily points (delta from previous day)
-        day_points = {}
-        prev_total = None
+        # Build day-by-day points array (Mon=0 to Sun=6)
+        days_array = [None] * 7
+        weekly_total = 0
 
         for i in range(7):
             day_dt = monday_dt + timedelta(days=i)
             day_str = day_dt.strftime("%Y-%m-%d")
 
-            if day_str in totals:
-                current_total = totals[day_str]
-                if prev_total is not None:
-                    day_points[day_str] = current_total - prev_total
+            if day_str in daily:
+                # We have a snapshot for this day
+                day_pts = daily[day_str]["event_total"] // POINTS_DIVISOR
+                days_array[i] = day_pts
+                weekly_total += day_pts
+            elif day_str <= today_str:
+                # We missed this day — try to compute from surrounding totals
+                # Find nearest previous and next snapshots
+                prev_total = None
+                next_total = None
+
+                # Look backwards for previous total
+                if i == 0 and eid in prev_sunday_totals:
+                    prev_total = prev_sunday_totals[eid]
                 else:
-                    # First day we have data — use event_total from snapshot
-                    snapshot = daily_snapshots.get(day_str)
-                    if snapshot:
-                        for se in snapshot["entries"]:
-                            if se["entry"] == eid:
-                                day_points[day_str] = se["event_total"]
-                                break
-                    if day_str not in day_points:
-                        day_points[day_str] = 0
-                prev_total = current_total
+                    for j in range(i - 1, -1, -1):
+                        prev_day = (monday_dt + timedelta(days=j)).strftime("%Y-%m-%d")
+                        if prev_day in daily:
+                            prev_total = daily[prev_day]["total"]
+                            break
+                    if prev_total is None and eid in prev_sunday_totals:
+                        prev_total = prev_sunday_totals[eid]
 
-        # Weekly total = sum of daily points
-        weekly_total = sum(day_points.values())
+                # Look forward
+                for j in range(i + 1, 7):
+                    next_day = (monday_dt + timedelta(days=j)).strftime("%Y-%m-%d")
+                    if next_day in daily:
+                        next_total = daily[next_day]["total"]
+                        break
 
-        # Build day-by-day array (Mon=0 to Sun=6)
-        days_array = []
-        for i in range(7):
-            day_dt = monday_dt + timedelta(days=i)
-            day_str = day_dt.strftime("%Y-%m-%d")
-            if day_str in day_points:
-                days_array.append(day_points[day_str])
-            else:
-                days_array.append(None)
+                # If we have both, we can estimate the gap but can't split per day
+                # Leave as None (unknown) for now
+                days_array[i] = None
+
+        # If we only have today's snapshot and no previous reference,
+        # try computing weekly total from total difference
+        if len(sorted_days) == 1 and eid in prev_sunday_totals:
+            today_total = daily[sorted_days[0]]["total"]
+            week_diff = (today_total - prev_sunday_totals[eid]) // POINTS_DIVISOR
+            # This gives Mon+Tue+...+today combined
+            # We already have today's event_total, so the rest is the gap
+            weekly_total = week_diff
 
         weekly_data.append({
             "entry": eid,
@@ -282,41 +283,23 @@ def compute_weekly_ranking(today_str):
     for i, entry in enumerate(weekly_data):
         entry["rank"] = i + 1
 
-    # Compute movement (change vs yesterday's ranking)
-    # Yesterday's ranking = same computation but only with data up to yesterday
-    yesterday_ranking = {}
-    if yesterday_str in daily_snapshots and yesterday_str >= monday_str:
-        # Rebuild yesterday's weekly totals
-        for eid, info in entry_info.items():
-            totals = entry_totals.get(eid, {})
-            prev_total = None
+    # Compute movement (today's rank vs yesterday's rank in weekly standings)
+    if yesterday_str in daily_snapshots:
+        # Build yesterday's weekly totals
+        yesterday_weekly = {}
+        for eid in entry_info:
+            daily = entry_daily.get(eid, {})
             yday_total = 0
-
-            for i in range(7):
-                day_dt = monday_dt + timedelta(days=i)
-                day_str = day_dt.strftime("%Y-%m-%d")
+            for day_str in sorted_days:
                 if day_str > yesterday_str:
                     break
-                if day_str in totals:
-                    current_total = totals[day_str]
-                    if prev_total is not None:
-                        yday_total += current_total - prev_total
-                    else:
-                        snapshot = daily_snapshots.get(day_str)
-                        if snapshot:
-                            for se in snapshot["entries"]:
-                                if se["entry"] == eid:
-                                    yday_total += se["event_total"]
-                                    break
-                    prev_total = current_total
+                if day_str in daily:
+                    yday_total += daily[day_str]["event_total"] // POINTS_DIVISOR
+            yesterday_weekly[eid] = yday_total
 
-            yesterday_ranking[eid] = yday_total
-
-        # Sort yesterday's data to get ranks
-        sorted_yesterday = sorted(yesterday_ranking.items(), key=lambda x: x[1], reverse=True)
+        sorted_yesterday = sorted(yesterday_weekly.items(), key=lambda x: x[1], reverse=True)
         yesterday_rank_map = {eid: rank + 1 for rank, (eid, _) in enumerate(sorted_yesterday)}
 
-        # Apply movement
         for entry in weekly_data:
             eid = entry["entry"]
             if eid in yesterday_rank_map:
@@ -330,16 +313,14 @@ def compute_weekly_ranking(today_str):
     return weekly_data
 
 
-def build_output(weekly_data, phase, today_str, last_updated):
+def build_output(weekly_data, today_str, last_updated):
     """Build the final JSON output for the frontend."""
     monday_str, sunday_str = get_week_bounds(today_str)
     today_dt = datetime.strptime(today_str, "%Y-%m-%d")
     monday_dt = datetime.strptime(monday_str, "%Y-%m-%d")
 
-    # Determine which day index is "today" (0=Mon, 6=Sun)
     today_index = today_dt.weekday()
 
-    # Day labels
     day_labels = []
     for i in range(7):
         day_dt = monday_dt + timedelta(days=i)
@@ -347,7 +328,6 @@ def build_output(weekly_data, phase, today_str, last_updated):
 
     output = {
         "meta": {
-            "phase": phase,
             "week_start": monday_str,
             "week_end": sunday_str,
             "today": today_str,
@@ -375,27 +355,15 @@ def build_output(weekly_data, phase, today_str, last_updated):
 
 def main():
     print("=" * 60)
-    print("NBA Fantasy Salary Cup — Daily Scraper")
+    print("NBA Fantasy Salary Cup — Daily Scraper v3")
     print("=" * 60)
 
     today_str = get_today_str()
     print(f"Date: {today_str}")
 
-    # Detect current phase
-    phase = get_current_phase()
-    if phase is None:
-        # Try to read from last snapshot
-        existing = sorted(DAILY_DIR.glob("*.json")) if DAILY_DIR.exists() else []
-        if existing:
-            with open(existing[-1]) as f:
-                phase = json.load(f).get("phase", 18)
-        else:
-            phase = 18
-    print(f"Phase: {phase}")
-
     # Fetch all standings
     start_time = time.time()
-    entries, last_updated = fetch_all_standings(phase)
+    entries, last_updated = fetch_all_standings()
     elapsed = time.time() - start_time
     print(f"\nFetched {len(entries)} entries in {elapsed:.1f}s")
 
@@ -403,15 +371,20 @@ def main():
         print("ERROR: No entries fetched. Aborting.")
         return
 
+    # Quick sanity check
+    top = entries[0]
+    print(f"Top entry: {top['player_name']} ({top['entry_name']})")
+    print(f"  total={top['total']} ({top['total']//POINTS_DIVISOR} real)")
+    print(f"  event_total={top['event_total']} ({top['event_total']//POINTS_DIVISOR} real)")
+
     # Save daily snapshot
-    save_daily_snapshot(entries, phase, today_str)
+    save_daily_snapshot(entries, today_str)
 
     # Compute weekly ranking
     weekly_data = compute_weekly_ranking(today_str)
 
     if weekly_data:
-        # Build and save output
-        output = build_output(weekly_data, phase, today_str, last_updated)
+        output = build_output(weekly_data, today_str, last_updated)
 
         OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
@@ -419,9 +392,11 @@ def main():
 
         print(f"\nOutput saved: {OUTPUT_FILE}")
         print(f"Total players in ranking: {len(weekly_data)}")
-        print(f"Top 5:")
+        print(f"Top 5 weekly:")
         for e in weekly_data[:5]:
-            print(f"  #{e['rank']} {e['player_name']} ({e['entry_name']}) — {e['total']} pts")
+            days_str = [str(d) if d is not None else "-" for d in e["days"]]
+            print(f"  #{e['rank']} {e['player_name']} ({e['entry_name']}) — "
+                  f"Week: {e['total']} pts — Days: [{', '.join(days_str)}]")
     else:
         print("Could not compute weekly ranking.")
 
