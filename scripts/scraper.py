@@ -233,48 +233,36 @@ def compute_weekly_ranking(today_str):
             day_dt = monday_dt + timedelta(days=i)
             day_str = day_dt.strftime("%Y-%m-%d")
 
-            if day_str in daily:
-                # We have a snapshot for this day
+            if day_str not in daily:
+                if day_str <= today_str:
+                    days_array[i] = None  # No snapshot for this day
+                continue
+
+            current_total = daily[day_str]["total"]
+
+            # Find the previous day's total to detect if games were played
+            prev_total = None
+
+            # Look backwards through previous snapshots
+            for j in range(i - 1, -1, -1):
+                prev_day = (monday_dt + timedelta(days=j)).strftime("%Y-%m-%d")
+                if prev_day in daily:
+                    prev_total = daily[prev_day]["total"]
+                    break
+
+            # If no previous snapshot this week, try last Sunday
+            if prev_total is None and eid in prev_sunday_totals:
+                prev_total = prev_sunday_totals[eid]
+
+            if prev_total is not None:
+                # Daily points = change in season total
+                day_pts = (current_total - prev_total) // POINTS_DIVISOR
+            else:
+                # First snapshot ever — use event_total as best guess
                 day_pts = daily[day_str]["event_total"] // POINTS_DIVISOR
-                days_array[i] = day_pts
-                weekly_total += day_pts
-            elif day_str <= today_str:
-                # We missed this day — try to compute from surrounding totals
-                # Find nearest previous and next snapshots
-                prev_total = None
-                next_total = None
 
-                # Look backwards for previous total
-                if i == 0 and eid in prev_sunday_totals:
-                    prev_total = prev_sunday_totals[eid]
-                else:
-                    for j in range(i - 1, -1, -1):
-                        prev_day = (monday_dt + timedelta(days=j)).strftime("%Y-%m-%d")
-                        if prev_day in daily:
-                            prev_total = daily[prev_day]["total"]
-                            break
-                    if prev_total is None and eid in prev_sunday_totals:
-                        prev_total = prev_sunday_totals[eid]
-
-                # Look forward
-                for j in range(i + 1, 7):
-                    next_day = (monday_dt + timedelta(days=j)).strftime("%Y-%m-%d")
-                    if next_day in daily:
-                        next_total = daily[next_day]["total"]
-                        break
-
-                # If we have both, we can estimate the gap but can't split per day
-                # Leave as None (unknown) for now
-                days_array[i] = None
-
-        # If we only have today's snapshot and no previous reference,
-        # try computing weekly total from total difference
-        if len(sorted_days) == 1 and eid in prev_sunday_totals:
-            today_total = daily[sorted_days[0]]["total"]
-            week_diff = (today_total - prev_sunday_totals[eid]) // POINTS_DIVISOR
-            # This gives Mon+Tue+...+today combined
-            # We already have today's event_total, so the rest is the gap
-            weekly_total = week_diff
+            days_array[i] = day_pts
+            weekly_total += day_pts
 
         weekly_data.append({
             "entry": eid,
@@ -293,16 +281,31 @@ def compute_weekly_ranking(today_str):
 
     # Compute movement (today's rank vs yesterday's rank in weekly standings)
     if yesterday_str in daily_snapshots:
-        # Build yesterday's weekly totals
+        # Rebuild yesterday's weekly totals using same delta logic
         yesterday_weekly = {}
         for eid in entry_info:
-            daily = entry_daily.get(eid, {})
+            daily_data = entry_daily.get(eid, {})
             yday_total = 0
             for day_str in sorted_days:
                 if day_str > yesterday_str:
                     break
-                if day_str in daily:
-                    yday_total += daily[day_str]["event_total"] // POINTS_DIVISOR
+                if day_str not in daily_data:
+                    continue
+                current_total = daily_data[day_str]["total"]
+                # Find previous day's total
+                prev_total = None
+                day_idx = (datetime.strptime(day_str, "%Y-%m-%d") - monday_dt).days
+                for j in range(day_idx - 1, -1, -1):
+                    prev_day = (monday_dt + timedelta(days=j)).strftime("%Y-%m-%d")
+                    if prev_day in daily_data:
+                        prev_total = daily_data[prev_day]["total"]
+                        break
+                if prev_total is None and eid in prev_sunday_totals:
+                    prev_total = prev_sunday_totals[eid]
+                if prev_total is not None:
+                    yday_total += (current_total - prev_total) // POINTS_DIVISOR
+                else:
+                    yday_total += daily_data[day_str]["event_total"] // POINTS_DIVISOR
             yesterday_weekly[eid] = yday_total
 
         sorted_yesterday = sorted(yesterday_weekly.items(), key=lambda x: x[1], reverse=True)
